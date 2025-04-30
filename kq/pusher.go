@@ -2,11 +2,11 @@ package kq
 
 import (
 	"context"
+	"github.com/chenleijava/go-queue/kq/internal"
 	"strconv"
 	"time"
 
 	"github.com/segmentio/kafka-go"
-	"github.com/zeromicro/go-queue/kq/internal"
 	"github.com/zeromicro/go-zero/core/executors"
 	"github.com/zeromicro/go-zero/core/logx"
 	"go.opentelemetry.io/otel"
@@ -37,6 +37,32 @@ type (
 
 		// syncPush is used to enable sync push
 		syncPush bool
+
+		// Limit on how many attempts will be made to deliver a message.
+		//
+		// The default is to try at most 10 times.
+		MaxAttempts int
+		// WriteBackoffMin optionally sets the smallest amount of time the writer waits before
+		// it attempts to write a batch of messages
+		//
+		// Default: 100ms
+		WriteBackoffMin time.Duration
+		// WriteBackoffMax optionally sets the maximum amount of time the writer waits before
+		// it attempts to write a batch of messages
+		//
+		// Default: 1s
+		WriteBackoffMax time.Duration
+
+		// Number of acknowledges from partition replicas required before receiving
+		// a response to a produce request, the following values are supported:
+		//
+		//  RequireNone (0)  fire-and-forget, do not wait for acknowledgements from the
+		//  RequireOne  (1)  wait for the leader to acknowledge the writes
+		//  RequireAll  (-1) wait for the full ISR to acknowledge the writes
+		//
+		// Defaults to RequireNone.
+		RequiredAcks kafka.RequiredAcks
+		Completion   func(messages []kafka.Message, err error)
 	}
 )
 
@@ -176,5 +202,69 @@ func WithFlushInterval(interval time.Duration) PushOption {
 func WithSyncPush() PushOption {
 	return func(options *pushOptions) {
 		options.syncPush = true
+	}
+}
+
+// WithMaxAttempts
+//
+//	@Description:
+//	@param MaxAttempts
+//	@return PushOption
+func WithMaxAttempts(maxAttempts int) PushOption {
+	return func(options *pushOptions) {
+		options.MaxAttempts = maxAttempts
+	}
+}
+
+// WithWriteBackoffMin
+//
+//	@Description:
+//
+// WriteBackoffMin optionally sets the smallest amount of time the writer waits before
+// it attempts to write a batch of messages
+//
+// Default: 100ms
+//
+//	@param writeBackoffMin
+//	@return PushOption
+func WithWriteBackoffMin(writeBackoffMin time.Duration) PushOption {
+	return func(options *pushOptions) {
+		options.WriteBackoffMin = writeBackoffMin
+	}
+}
+
+// WithWriteBackoffMax
+//
+//	 @Description:
+//	 WriteBackoffMax optionally sets the maximum amount of time the writer waits before
+//		it attempts to write a batch of messages
+//		Default: 1s
+//	 @param writeBackoffMax
+//	 @return PushOption
+func WithWriteBackoffMax(writeBackoffMax time.Duration) PushOption {
+	return func(options *pushOptions) {
+		options.WriteBackoffMax = writeBackoffMax
+	}
+}
+
+// WithRequiredAcks
+//
+//	@Description:
+//	@param acks
+//	@return PushOption
+func WithRequiredAcks(acks kafka.RequiredAcks) PushOption {
+	return func(options *pushOptions) {
+		options.RequiredAcks = acks
+	}
+}
+
+// WithCompletion
+//
+//	@Description:
+//	@param completion
+//	@return PushOption
+func WithCompletion(completion func(messages []kafka.Message, err error)) PushOption {
+	return func(options *pushOptions) {
+		options.Completion = completion
 	}
 }

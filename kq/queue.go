@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"github.com/chenleijava/go-queue/kq/internal"
 	"io"
 	"log"
 	"os"
@@ -15,7 +16,6 @@ import (
 	_ "github.com/segmentio/kafka-go/lz4"
 	"github.com/segmentio/kafka-go/sasl/plain"
 	_ "github.com/segmentio/kafka-go/snappy"
-	"github.com/zeromicro/go-queue/kq/internal"
 	"github.com/zeromicro/go-zero/core/contextx"
 	"github.com/zeromicro/go-zero/core/logc"
 	"github.com/zeromicro/go-zero/core/logx"
@@ -86,9 +86,10 @@ func MustNewQueue(c KqConf, handler ConsumeHandler, opts ...QueueOption) queue.M
 }
 
 func NewQueue(c KqConf, handler ConsumeHandler, opts ...QueueOption) (queue.MessageQueue, error) {
-	if err := c.SetUp(); err != nil {
-		return nil, err
-	}
+
+	//if err := c.SetUp(); err != nil {
+	//	return nil, err
+	//}
 
 	var options queueOptions
 	for _, opt := range opts {
@@ -126,7 +127,7 @@ func newKafkaQueue(c KqConf, handler ConsumeHandler, options queueOptions) queue
 		MaxBytes:       c.MaxBytes, // 10MB
 		MaxWait:        options.maxWait,
 		CommitInterval: options.commitInterval,
-		QueueCapacity:  options.queueCapacity,
+		QueueCapacity:  options.queueCapacity, // default 1000
 	}
 	if len(c.Username) > 0 && len(c.Password) > 0 {
 		readerConfig.Dialer = &kafka.Dialer{
