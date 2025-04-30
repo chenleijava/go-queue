@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"github.com/chenleijava/go-queue/kq/internal"
 	"io"
 	"log"
@@ -28,15 +29,19 @@ import (
 )
 
 const (
-	defaultCommitInterval = time.Second
-	defaultMaxWait        = time.Second
-	defaultQueueCapacity  = 1000
+	defaultCommitInterval = time.Second //提交给 kafka broker 间隔时间，默认是 1s
+	defaultMaxWait        = time.Second //从 kafka 批量获取数据时，等待新数据到来的最大时间
+	defaultQueueCapacity  = 1000        //kafka 内部队列长度
+
+	//
+	defaultBatchSize          = 1000
+	defaultBatchFlushInterval = time.Second
 )
 
 type (
 	ConsumeHandle func(ctx context.Context, key, value string) error
 
-	ConsumeErrorHandler func(ctx context.Context, msg kafka.Message, err error)
+	ConsumeErrorHandler func(ctx context.Context, err error, msgs ...kafka.Message)
 
 	ConsumeHandler interface {
 		Consume(ctx context.Context, key, value string) error
@@ -48,12 +53,19 @@ type (
 		Close() error
 	}
 
+	BatchHandle func(ctx context.Context, items []kafka.Message) error
+
 	queueOptions struct {
 		commitInterval time.Duration
 		queueCapacity  int
 		maxWait        time.Duration
 		metrics        *stat.Metrics
 		errorHandler   ConsumeErrorHandler
+
+		batchHandle        BatchHandle
+		batchFlushInterval time.Duration // flush interval
+		batchSize          int           // batch size
+
 	}
 
 	QueueOption func(*queueOptions)
@@ -65,9 +77,13 @@ type (
 		channel          chan kafka.Message
 		producerRoutines *threading.RoutineGroup
 		consumerRoutines *threading.RoutineGroup
-		commitRunner     *threading.StableRunner[kafka.Message, kafka.Message]
-		metrics          *stat.Metrics
-		errorHandler     ConsumeErrorHandler
+
+		batchHandle BatchHandle
+		batch       *internal.BatchProcessor[kafka.Message]
+
+		commitRunner *threading.StableRunner[kafka.Message, kafka.Message]
+		metrics      *stat.Metrics
+		errorHandler ConsumeErrorHandler //force commit message . the error handler record the message
 	}
 
 	kafkaQueues struct {
@@ -76,23 +92,17 @@ type (
 	}
 )
 
-func MustNewQueue(c KqConf, handler ConsumeHandler, opts ...QueueOption) queue.MessageQueue {
-	q, err := NewQueue(c, handler, opts...)
+func MustNewQueue(c KqConf, handler ConsumeHandler, queueOpts ...QueueOption) queue.MessageQueue {
+	q, err := NewQueue(c, handler, queueOpts...)
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	return q
 }
 
-func NewQueue(c KqConf, handler ConsumeHandler, opts ...QueueOption) (queue.MessageQueue, error) {
-
-	//if err := c.SetUp(); err != nil {
-	//	return nil, err
-	//}
-
+func NewQueue(c KqConf, handler ConsumeHandler, queueOpts ...QueueOption) (queue.MessageQueue, error) {
 	var options queueOptions
-	for _, opt := range opts {
+	for _, opt := range queueOpts {
 		opt(&options)
 	}
 	ensureQueueOptions(c, &options)
@@ -129,6 +139,7 @@ func newKafkaQueue(c KqConf, handler ConsumeHandler, options queueOptions) queue
 		CommitInterval: options.commitInterval,
 		QueueCapacity:  options.queueCapacity, // default 1000
 	}
+
 	if len(c.Username) > 0 && len(c.Password) > 0 {
 		readerConfig.Dialer = &kafka.Dialer{
 			SASLMechanism: plain.Mechanism{
@@ -137,6 +148,7 @@ func newKafkaQueue(c KqConf, handler ConsumeHandler, options queueOptions) queue
 			},
 		}
 	}
+
 	if len(c.CaFile) > 0 {
 		caCert, err := os.ReadFile(c.CaFile)
 		if err != nil {
@@ -154,6 +166,7 @@ func newKafkaQueue(c KqConf, handler ConsumeHandler, options queueOptions) queue
 			InsecureSkipVerify: true,
 		}
 	}
+
 	consumer := kafka.NewReader(readerConfig)
 
 	q := &kafkaQueue{
@@ -166,11 +179,18 @@ func newKafkaQueue(c KqConf, handler ConsumeHandler, options queueOptions) queue
 		metrics:          options.metrics,
 		errorHandler:     options.errorHandler,
 	}
+
+	//batch process the kafka message
+	if options.batchHandle != nil {
+		q.batch = internal.NewBatchProcessor[kafka.Message](options.batchSize, options.batchFlushInterval, q.consumerBatchProcess)
+		q.batch.Start()
+	}
+
 	if c.CommitInOrder {
 		q.commitRunner = threading.NewStableRunner(func(msg kafka.Message) kafka.Message {
 			if err := q.consumeOne(context.Background(), string(msg.Key), string(msg.Value)); err != nil {
 				if q.errorHandler != nil {
-					q.errorHandler(context.Background(), msg, err)
+					q.errorHandler(context.Background(), err, msg)
 				}
 			}
 
@@ -184,7 +204,6 @@ func newKafkaQueue(c KqConf, handler ConsumeHandler, options queueOptions) queue
 func (q *kafkaQueue) Start() {
 	if q.c.CommitInOrder {
 		go q.commitInOrder()
-
 		if err := q.consume(func(msg kafka.Message) {
 			if e := q.commitRunner.Push(msg); e != nil {
 				logx.Error(e)
@@ -192,22 +211,37 @@ func (q *kafkaQueue) Start() {
 		}); err != nil {
 			logx.Error(err)
 		}
+	} else if q.batch != nil {
+		// pull message form kafka
+		q.startProducers()
+		q.producerRoutines.Wait()
+		logx.Infof("Consumer %s is closed", q.c.Name)
 	} else {
-		q.startConsumers()
+		q.startConsumers() // consumers handle message
 		q.startProducers()
 		q.producerRoutines.Wait()
 		close(q.channel)
 		q.consumerRoutines.Wait()
-
 		logx.Infof("Consumer %s is closed", q.c.Name)
 	}
 }
 
 func (q *kafkaQueue) Stop() {
 	q.consumer.Close()
+	if q.batch != nil {
+		q.batch.Stop()
+	}
 	logx.Close()
 }
 
+// consumeOne
+//
+//	@Description: call logic and handle message
+//	@receiver q
+//	@param ctx
+//	@param key
+//	@param val
+//	@return error
 func (q *kafkaQueue) consumeOne(ctx context.Context, key, val string) error {
 	startTime := timex.Now()
 	err := q.handler.Consume(ctx, key, val)
@@ -217,6 +251,10 @@ func (q *kafkaQueue) consumeOne(ctx context.Context, key, val string) error {
 	return err
 }
 
+// startConsumers
+//
+//	@Description: start consumers , processors of the partitions
+//	@receiver q
 func (q *kafkaQueue) startConsumers() {
 	for i := 0; i < q.c.Processors; i++ {
 		q.consumerRoutines.Run(func() {
@@ -228,38 +266,87 @@ func (q *kafkaQueue) startConsumers() {
 				// remove deadline and error control
 				ctx = contextx.ValueOnlyFrom(ctx)
 
+				//logic hand message
 				if err := q.consumeOne(ctx, string(msg.Key), string(msg.Value)); err != nil {
 					if q.errorHandler != nil {
-						q.errorHandler(ctx, msg, err)
-					}
-
-					if !q.c.ForceCommit {
-						continue
+						q.errorHandler(ctx, err, msg)
 					}
 				}
 
+				//commit message offset
 				if err := q.consumer.CommitMessages(ctx, msg); err != nil {
-					logc.Errorf(ctx, "commit failed, error: %v", err)
+					if q.errorHandler != nil {
+						q.errorHandler(ctx, errors.New(fmt.Sprintf("commit failed, error: %v", err)), msg)
+					}
 				}
+
 			}
 		})
 	}
 }
 
+// consumerBatchProcess
+//
+//	@Description: batch process message . if err==nil. the items be commited
+//	@receiver q
+//	@param items
+//	@return error
+func (q *kafkaQueue) consumerBatchProcess(items []kafka.Message) error {
+	//TODO span
+	ctx := context.Background()
+	err := q.batchHandle(ctx, items)
+	if err != nil {
+		if q.errorHandler != nil {
+			q.errorHandler(ctx, err, items...)
+		}
+		return err
+	} else {
+		if err = q.consumer.CommitMessages(ctx, items...); err != nil {
+			if q.errorHandler != nil {
+				q.errorHandler(ctx, errors.New(fmt.Sprintf("commit failed, error: %v", err)), items...)
+			}
+		}
+		return err
+	}
+}
+
+// startProducers
+//
+//	@Description:
+//	@receiver q
 func (q *kafkaQueue) startProducers() {
+	//partitions: consumers*1.5
 	for i := 0; i < q.c.Consumers; i++ {
 		i := i
-		q.producerRoutines.Run(func() {
-			if err := q.consume(func(msg kafka.Message) {
-				q.channel <- msg
-			}); err != nil {
-				logx.Infof("Consumer %s-%d is closed, error: %q", q.c.Name, i, err.Error())
-				return
-			}
-		})
+		if q.batch != nil {
+			q.producerRoutines.Run(func() {
+				if err := q.consume(func(msg kafka.Message) {
+					q.batch.Add(msg)
+				}); err != nil {
+					logx.Infof("Consumer %s-%d is closed, error: %q", q.c.Name, i, err.Error())
+					return
+				}
+			})
+		} else {
+			//pull message from kafka and cache the channel
+			q.producerRoutines.Run(func() {
+				if err := q.consume(func(msg kafka.Message) {
+					q.channel <- msg
+				}); err != nil {
+					logx.Infof("Consumer %s-%d is closed, error: %q", q.c.Name, i, err.Error())
+					return
+				}
+			})
+		}
 	}
 }
 
+// consume
+//
+//	@Description:
+//	@receiver q
+//	@param handle
+//	@return error
 func (q *kafkaQueue) consume(handle func(msg kafka.Message)) error {
 	for {
 		msg, err := q.consumer.FetchMessage(context.Background())
@@ -333,9 +420,49 @@ func WithMetrics(metrics *stat.Metrics) QueueOption {
 	}
 }
 
+// WithErrorHandler
+//
+//	@Description: go-queue handle message  ,if err!=nil  ,will call this func
+//	@param errorHandler
+//	@return QueueOption
 func WithErrorHandler(errorHandler ConsumeErrorHandler) QueueOption {
 	return func(options *queueOptions) {
 		options.errorHandler = errorHandler
+	}
+}
+
+// WithBatchHandle
+//
+//	@Description: batch handle
+//	@param batchHandle
+//	@return QueueOption
+func WithBatchHandle(batchHandle BatchHandle) QueueOption {
+	return func(options *queueOptions) {
+		options.batchHandle = batchHandle
+	}
+}
+
+// WithBatchFlushInterval
+//
+//	@Description:  batch flush of the windows
+//	@param batchFlushInterval default 1s
+//	@return BatchOption
+func WithBatchFlushInterval(flushInterval string) QueueOption {
+	return func(options *queueOptions) {
+		f, err := time.ParseDuration(flushInterval)
+		logx.Must(err)
+		options.batchFlushInterval = f
+	}
+}
+
+// WithBatchSize
+//
+//	@Description:
+//	@param batchSize default 1000
+//	@return BatchOption
+func WithBatchSize(batchSize int) QueueOption {
+	return func(options *queueOptions) {
+		options.batchSize = batchSize
 	}
 }
 
@@ -348,6 +475,15 @@ func (ch innerConsumeHandler) Consume(ctx context.Context, k, v string) error {
 }
 
 func ensureQueueOptions(c KqConf, options *queueOptions) {
+
+	if options.batchFlushInterval == 0 {
+		options.batchFlushInterval = defaultBatchFlushInterval
+	}
+
+	if options.batchSize == 0 {
+		options.batchSize = defaultBatchSize
+	}
+
 	if options.commitInterval == 0 {
 		options.commitInterval = defaultCommitInterval
 	}
@@ -361,8 +497,8 @@ func ensureQueueOptions(c KqConf, options *queueOptions) {
 		options.metrics = stat.NewMetrics(c.Name)
 	}
 	if options.errorHandler == nil {
-		options.errorHandler = func(ctx context.Context, msg kafka.Message, err error) {
-			logc.Errorf(ctx, "consume: %s, error: %v", string(msg.Value), err)
+		options.errorHandler = func(ctx context.Context, err error, msgs ...kafka.Message) {
+			logc.Errorf(ctx, "consume: %+v, error: %v", msgs, err)
 		}
 	}
 }
