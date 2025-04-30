@@ -82,8 +82,29 @@ func NewPusher(addrs []string, topic string, opts ...PushOption) *Pusher {
 
 	// apply kafka.Writer options
 	producer.AllowAutoTopicCreation = options.allowAutoTopicCreation
+
 	if options.balancer != nil {
 		producer.Balancer = options.balancer
+	}
+
+	if options.MaxAttempts != 0 {
+		producer.MaxAttempts = options.MaxAttempts
+	}
+
+	if options.WriteBackoffMin != 0 {
+		producer.WriteBackoffMin = options.WriteBackoffMin
+	}
+
+	if options.WriteBackoffMax != 0 {
+		producer.WriteBackoffMax = options.WriteBackoffMax
+	}
+
+	if options.RequiredAcks != 0 {
+		producer.RequiredAcks = options.RequiredAcks
+	}
+
+	if options.Completion != nil {
+		producer.Completion = options.Completion
 	}
 
 	pusher := &Pusher{
@@ -251,7 +272,15 @@ func WithWriteBackoffMax(writeBackoffMax time.Duration) PushOption {
 //
 //	@Description:
 //	@param acks
-//	@return PushOption
+//
+// Number of acknowledges from partition replicas required before receiving
+// a response to a produce request, the following values are supported:
+//
+//	 RequireNone (0)  fire-and-forget, do not wait for acknowledgements from the
+//	 RequireOne  (1)  wait for the leader to acknowledge the writes
+//	 RequireAll  (-1) wait for the full ISR to acknowledge the writes
+//
+//		@return PushOption
 func WithRequiredAcks(acks kafka.RequiredAcks) PushOption {
 	return func(options *pushOptions) {
 		options.RequiredAcks = acks
