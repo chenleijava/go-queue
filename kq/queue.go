@@ -33,7 +33,7 @@ const (
 	defaultMaxWait        = time.Second //从 kafka 批量获取数据时，等待新数据到来的最大时间
 	defaultQueueCapacity  = 1000        //kafka 内部队列长度
 
-	//
+	//batch process args
 	defaultBatchSize          = 1000
 	defaultBatchFlushInterval = time.Second
 )
@@ -62,9 +62,9 @@ type (
 		metrics        *stat.Metrics
 		errorHandler   ConsumeErrorHandler
 
-		batchHandle        BatchHandle
+		batchHandle        BatchHandle   // batch processor logic handler --for options
 		batchFlushInterval time.Duration // flush interval
-		batchSize          int           // batch size
+		batchSize          int           // batchProcessor size
 
 	}
 
@@ -78,8 +78,8 @@ type (
 		producerRoutines *threading.RoutineGroup
 		consumerRoutines *threading.RoutineGroup
 
-		batchHandle BatchHandle
-		batch       *internal.BatchProcessor[kafka.Message]
+		batchHandle    BatchHandle                             // batchProcessor logic handler
+		batchProcessor *internal.BatchProcessor[kafka.Message] //batchProcessor processor
 
 		commitRunner *threading.StableRunner[kafka.Message, kafka.Message]
 		metrics      *stat.Metrics
@@ -180,10 +180,11 @@ func newKafkaQueue(c KqConf, handler ConsumeHandler, options queueOptions) queue
 		errorHandler:     options.errorHandler,
 	}
 
-	//batch process the kafka message
+	//batchProcessor process the kafka message
 	if options.batchHandle != nil {
-		q.batch = internal.NewBatchProcessor[kafka.Message](options.batchSize, options.batchFlushInterval, q.consumerBatchProcess)
-		q.batch.Start()
+		q.batchHandle = options.batchHandle
+		q.batchProcessor = internal.NewBatchProcessor[kafka.Message](options.batchSize, options.batchFlushInterval, q.consumerBatchProcess)
+		q.batchProcessor.Start()
 	}
 
 	if c.CommitInOrder {
@@ -211,7 +212,7 @@ func (q *kafkaQueue) Start() {
 		}); err != nil {
 			logx.Error(err)
 		}
-	} else if q.batch != nil {
+	} else if q.batchProcessor != nil {
 		// pull message form kafka
 		q.startProducers()
 		q.producerRoutines.Wait()
@@ -228,8 +229,8 @@ func (q *kafkaQueue) Start() {
 
 func (q *kafkaQueue) Stop() {
 	q.consumer.Close()
-	if q.batch != nil {
-		q.batch.Stop()
+	if q.batchProcessor != nil {
+		q.batchProcessor.Stop()
 	}
 	logx.Close()
 }
@@ -273,6 +274,7 @@ func (q *kafkaQueue) startConsumers() {
 					}
 				}
 
+				//force commit!!!
 				//commit message offset
 				if err := q.consumer.CommitMessages(ctx, msg); err != nil {
 					if q.errorHandler != nil {
@@ -287,12 +289,11 @@ func (q *kafkaQueue) startConsumers() {
 
 // consumerBatchProcess
 //
-//	@Description: batch process message . if err==nil. the items be commited
+//	@Description: batchProcessor process message . if err==nil. the items be commited
 //	@receiver q
 //	@param items
 //	@return error
 func (q *kafkaQueue) consumerBatchProcess(items []kafka.Message) error {
-	//TODO span
 	ctx := context.Background()
 	err := q.batchHandle(ctx, items)
 	if err != nil {
@@ -318,10 +319,10 @@ func (q *kafkaQueue) startProducers() {
 	//partitions: consumers*1.5
 	for i := 0; i < q.c.Consumers; i++ {
 		i := i
-		if q.batch != nil {
+		if q.batchProcessor != nil {
 			q.producerRoutines.Run(func() {
 				if err := q.consume(func(msg kafka.Message) {
-					q.batch.Add(msg)
+					q.batchProcessor.Add(msg)
 				}); err != nil {
 					logx.Infof("Consumer %s-%d is closed, error: %q", q.c.Name, i, err.Error())
 					return
@@ -433,7 +434,7 @@ func WithErrorHandler(errorHandler ConsumeErrorHandler) QueueOption {
 
 // WithBatchHandle
 //
-//	@Description: batch handle
+//	@Description: batchProcessor handle
 //	@param batchHandle
 //	@return QueueOption
 func WithBatchHandle(batchHandle BatchHandle) QueueOption {
@@ -444,7 +445,7 @@ func WithBatchHandle(batchHandle BatchHandle) QueueOption {
 
 // WithBatchFlushInterval
 //
-//	@Description:  batch flush of the windows
+//	@Description:  batchProcessor flush of the windows
 //	@param batchFlushInterval default 1s
 //	@return BatchOption
 func WithBatchFlushInterval(flushInterval string) QueueOption {

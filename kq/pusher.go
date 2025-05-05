@@ -43,12 +43,12 @@ type (
 		// The default is to try at most 10 times.
 		MaxAttempts int
 		// WriteBackoffMin optionally sets the smallest amount of time the writer waits before
-		// it attempts to write a batch of messages
+		// it attempts to write a batchProcessor of messages
 		//
 		// Default: 100ms
 		WriteBackoffMin time.Duration
 		// WriteBackoffMax optionally sets the maximum amount of time the writer waits before
-		// it attempts to write a batch of messages
+		// it attempts to write a batchProcessor of messages
 		//
 		// Default: 1s
 		WriteBackoffMax time.Duration
@@ -242,7 +242,7 @@ func WithMaxAttempts(maxAttempts int) PushOption {
 //	@Description:
 //
 // WriteBackoffMin optionally sets the smallest amount of time the writer waits before
-// it attempts to write a batch of messages
+// it attempts to write a batchProcessor of messages
 //
 // Default: 100ms
 //
@@ -258,7 +258,7 @@ func WithWriteBackoffMin(writeBackoffMin time.Duration) PushOption {
 //
 //	 @Description:
 //	 WriteBackoffMax optionally sets the maximum amount of time the writer waits before
-//		it attempts to write a batch of messages
+//		it attempts to write a batchProcessor of messages
 //		Default: 1s
 //	 @param writeBackoffMax
 //	 @return PushOption
