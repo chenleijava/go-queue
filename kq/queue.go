@@ -29,9 +29,9 @@ import (
 )
 
 const (
-	defaultCommitInterval = time.Second //提交给 kafka broker 间隔时间，默认是 1s
-	defaultMaxWait        = time.Second //从 kafka 批量获取数据时，等待新数据到来的最大时间
-	defaultQueueCapacity  = 1000        //kafka 内部队列长度
+	//defaultCommitInterval = time.Second //提交给 kafka broker 间隔时间，默认是 1s
+	defaultMaxWait       = time.Second //从 kafka 批量获取数据时，等待新数据到来的最大时间
+	defaultQueueCapacity = 1000        //kafka 内部队列长度
 
 	//batch process args
 	defaultBatchSize          = 1000
@@ -129,13 +129,15 @@ func newKafkaQueue(c KqConf, handler ConsumeHandler, options queueOptions) queue
 	}
 
 	readerConfig := kafka.ReaderConfig{
-		Brokers:        c.Brokers,
-		GroupID:        c.Group,
-		Topic:          c.Topic,
-		StartOffset:    offset,
-		MinBytes:       c.MinBytes, // 10KB
-		MaxBytes:       c.MaxBytes, // 10MB
-		MaxWait:        options.maxWait,
+		Brokers:     c.Brokers,
+		GroupID:     c.Group,
+		Topic:       c.Topic,
+		StartOffset: offset,
+		MinBytes:    c.MinBytes, // 10KB
+		MaxBytes:    c.MaxBytes, // 10MB
+		MaxWait:     options.maxWait,
+		//CommitInterval indicates the interval at which offsets are committed to the broker.
+		//If 0, commits will be handled synchronously.
 		CommitInterval: options.commitInterval,
 		QueueCapacity:  options.queueCapacity, // default 1000
 	}
@@ -350,6 +352,7 @@ func (q *kafkaQueue) startProducers() {
 //	@return error
 func (q *kafkaQueue) consume(handle func(msg kafka.Message)) error {
 	for {
+		//fetch message
 		msg, err := q.consumer.FetchMessage(context.Background())
 		// io.EOF means consumer closed
 		// io.ErrClosedPipe means committing messages on the consumer,
@@ -391,6 +394,11 @@ func (q kafkaQueues) Stop() {
 	q.group.Stop()
 }
 
+// WithCommitInterval
+//
+//	@Description:
+//	@param interval
+//	@return QueueOption
 func WithCommitInterval(interval time.Duration) QueueOption {
 	return func(options *queueOptions) {
 		options.commitInterval = interval
@@ -485,9 +493,10 @@ func ensureQueueOptions(c KqConf, options *queueOptions) {
 		options.batchSize = defaultBatchSize
 	}
 
-	if options.commitInterval == 0 {
-		options.commitInterval = defaultCommitInterval
-	}
+	//if options.commitInterval == 0 {
+	//	options.commitInterval = defaultCommitInterval
+	//}
+
 	if options.queueCapacity == 0 {
 		options.queueCapacity = defaultQueueCapacity
 	}
